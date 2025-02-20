@@ -21,8 +21,9 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-// WorkerStats 保存每个 worker 的局部统计数据
+// WorkerStats 保存每个 worker 的局部统计数据，加锁确保并发安全
 type WorkerStats struct {
+	mu              sync.Mutex
 	TotalRequests   int64
 	SuccessRequests int64
 	FailedRequests  int64
@@ -33,12 +34,12 @@ type WorkerStats struct {
 
 // Stats 用于聚合统计数据
 type Stats struct {
-	TotalRequests   int64           // 总请求数
-	SuccessRequests int64           // 成功请求数
-	FailedRequests  int64           // 失败请求数
-	TotalTime       time.Duration   // 总耗时
-	ResponseTimes   []time.Duration // 所有请求的响应时延
-	StatusCodes     map[int]int     // HTTP 状态码统计，键为状态码，值为出现次数
+	TotalRequests   int64
+	SuccessRequests int64
+	FailedRequests  int64
+	TotalTime       time.Duration
+	ResponseTimes   []time.Duration
+	StatusCodes     map[int]int
 }
 
 // 全局趋势数组（TPS、QPS 为数值，响应时延单位为 ms）
@@ -59,7 +60,7 @@ var requestBodies [][]string
 var clientKeepAlive *http.Client
 var clientNoKeepAlive *http.Client
 
-// 全局原子计数器（用于快速汇总）
+// 全局原子计数器
 var globalTotalRequests int64
 var globalSuccessRequests int64
 var globalFailedRequests int64
@@ -99,6 +100,7 @@ func main() {
 	flag.Float64Var(&keepAliveRatio, "keepalive_ratio", 0.7, "Ratio of requests using keep-alive (0.0 - 1.0)")
 	flag.StringVar(&method, "X", "POST", "HTTP method (GET, POST, etc.)")
 	flag.StringVar(&bodyFile, "bodyfile", "", "JSON file containing request bodies")
+	// reportInterval 表示每累计 N 个请求后输出一次统计
 	flag.IntVar(&reportInterval, "interval", 20, "Report stats every N requests")
 	flag.Parse()
 
@@ -115,17 +117,21 @@ func main() {
 
 	bar := progressbar.Default(int64(totalRequests))
 
-	// 创建 per-worker 统计数据，每个 worker 独占一个 WorkerStats 实例（预分配容量）
+	// 初始化各个 worker 的统计数据
 	workerStats := make([]*WorkerStats, concurrency)
-	requestsPerWorker := totalRequests / concurrency
 	for i := 0; i < concurrency; i++ {
 		workerStats[i] = &WorkerStats{
-			ResponseTimes: make([]time.Duration, 0, requestsPerWorker),
+			ResponseTimes: make([]time.Duration, 0),
 			StatusCodes:   make(map[int]int),
 		}
 	}
 
-	// 启动一个 ticker，每秒聚合所有 worker 数据进行阶段性报告
+	// 设置全局统计起始时间，用于累计统计
+	globalStartTime := time.Now()
+	// 用于记录上次输出统计时的请求数量
+	var lastReportedRequests int64 = 0
+
+	// 启动 ticker，根据累计请求数达到 reportInterval 时输出统计
 	doneChan := make(chan struct{})
 	var tickerWg sync.WaitGroup
 	tickerWg.Add(1)
@@ -136,22 +142,30 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				aggStats := aggregateWorkerStats(workerStats)
-				// 以当前时间作为参考，仅用于阶段性展示
-				reportStats(&aggStats, time.Now())
+				currentTotal := atomic.LoadInt64(&globalTotalRequests)
+				if currentTotal-lastReportedRequests >= int64(reportInterval) {
+					aggStats := aggregateWorkerStats(workerStats)
+					now := time.Now()
+					reportStats(&aggStats, globalStartTime, now)
+					lastReportedRequests = currentTotal
+				}
 			case <-doneChan:
 				return
 			}
 		}
 	}()
 
+	// 使用原子计数器分发请求，确保总请求数准确
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
-		go func(idx int) {
+		go func(ws *WorkerStats) {
 			defer wg.Done()
-			ws := workerStats[idx]
-			for j := 0; j < requestsPerWorker; j++ {
+			for {
+				reqNum := int(atomic.AddInt64(&globalTotalRequests, 1))
+				if reqNum > totalRequests {
+					break
+				}
 				startReq := time.Now()
 				reqURL, body := getRandomRequest(url)
 				var client *http.Client
@@ -169,7 +183,10 @@ func main() {
 				}
 				req, err := http.NewRequest(method, reqURL, strings.NewReader(body))
 				if err != nil {
+					ws.mu.Lock()
 					ws.FailedRequests++
+					ws.TotalRequests++
+					ws.mu.Unlock()
 					atomic.AddInt64(&globalFailedRequests, 1)
 					continue
 				}
@@ -179,7 +196,10 @@ func main() {
 				resp, err := client.Do(req)
 				var duration time.Duration
 				if err != nil {
+					ws.mu.Lock()
 					ws.FailedRequests++
+					ws.TotalRequests++
+					ws.mu.Unlock()
 					atomic.AddInt64(&globalFailedRequests, 1)
 				} else {
 					_, _ = io.Copy(io.Discard, resp.Body)
@@ -189,6 +209,7 @@ func main() {
 					} else {
 						duration = time.Since(startReq)
 					}
+					ws.mu.Lock()
 					if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 						ws.SuccessRequests++
 						atomic.AddInt64(&globalSuccessRequests, 1)
@@ -198,25 +219,25 @@ func main() {
 					}
 					ws.StatusCodes[resp.StatusCode]++
 					ws.ResponseTimes = append(ws.ResponseTimes, duration)
+					ws.TotalRequests++
+					ws.TotalTime += time.Since(startReq)
+					ws.mu.Unlock()
 				}
-				ws.TotalRequests++
-				atomic.AddInt64(&globalTotalRequests, 1)
-				ws.TotalTime += time.Since(startReq)
 				bar.Add(1)
 			}
-		}(i)
+		}(workerStats[i])
 	}
 
 	wg.Wait()
 	close(doneChan)
 	tickerWg.Wait()
 
-	// 最终汇总所有 worker 的统计数据
+	// 最终汇总所有 worker 的统计数据并输出累计统计结果
 	finalStats := aggregateWorkerStats(workerStats)
 	endTime := time.Now()
 	fmt.Println("\n======================================")
 	fmt.Println("✅  Test completed! Final statistics:")
-	reportStats(&finalStats, endTime)
+	reportStats(&finalStats, globalStartTime, endTime)
 
 	ensureNonEmptyHistory()
 
@@ -235,13 +256,14 @@ func main() {
 	fmt.Println(asciigraph.Plot(p99History, asciigraph.Height(5)))
 }
 
-// aggregateWorkerStats 将所有 worker 的统计数据合并为全局统计数据
+// aggregateWorkerStats 将所有 worker 的统计数据合并为全局统计数据，读数据时加锁
 func aggregateWorkerStats(workers []*WorkerStats) Stats {
 	global := Stats{
 		StatusCodes:   make(map[int]int),
 		ResponseTimes: make([]time.Duration, 0),
 	}
 	for _, ws := range workers {
+		ws.mu.Lock()
 		global.TotalRequests += ws.TotalRequests
 		global.SuccessRequests += ws.SuccessRequests
 		global.FailedRequests += ws.FailedRequests
@@ -250,13 +272,12 @@ func aggregateWorkerStats(workers []*WorkerStats) Stats {
 			global.StatusCodes[code] += count
 		}
 		global.ResponseTimes = append(global.ResponseTimes, ws.ResponseTimes...)
+		ws.mu.Unlock()
 	}
 	return global
 }
 
-// loadBodiesFromFile 读取 JSON 文件，支持两种格式：
-// 1. ["body1", "body2", ...]
-// 2. [["url1", "body1"], ["url2", "body2"], ...]
+// loadBodiesFromFile 读取 JSON 文件，支持两种格式
 func loadBodiesFromFile(filename string) {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
@@ -322,9 +343,9 @@ func percentile(durations []time.Duration, percent float64) time.Duration {
 	return durations[index]
 }
 
-// reportStats 输出当前统计，并更新全局趋势数组；refTime 用于计算当前时间差
-func reportStats(stats *Stats, refTime time.Time) {
-	totalDuration := time.Since(refTime)
+// reportStats 输出当前累计统计数据，并更新全局趋势数组；统计周期为 startTime 到 now 的间隔
+func reportStats(stats *Stats, startTime, now time.Time) {
+	totalDuration := now.Sub(startTime)
 	if totalDuration.Seconds() == 0 {
 		return
 	}
@@ -342,7 +363,6 @@ func reportStats(stats *Stats, refTime time.Time) {
 	p95 := percentile(stats.ResponseTimes, 95)
 	p99 := percentile(stats.ResponseTimes, 99)
 
-	// 更新全局趋势数组（TPS、QPS 为数值；响应时延单位为 ms）
 	tpsHistory = append(tpsHistory, tps)
 	qpsHistory = append(qpsHistory, qps)
 	p50History = append(p50History, float64(p50.Milliseconds()))
