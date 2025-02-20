@@ -2,3 +2,4 @@
 /go.sum
 bodyfile.json
 http_bench
+http_bench_linux
